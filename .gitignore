@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local application storage
+storage/app.db
+storage/uploads/
+storage/indexes/
+storage/vision/
+
+# Generated / runtime files
+*.log
+*.tmp
+*.cache
+
+# Model / index artifacts
+*.faiss
+*.index
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# Local model/cache directories
+models/
+cache/
+.cache/
+
+# Temporary exports
+tmp/
+temp/
+
+# Local tooling
+.kilo/
+
+# Thesis / proposal documents
+proposal/
+Template Proposal Skripsi Non Kelas (1).pdf

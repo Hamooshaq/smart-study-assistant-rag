@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Smart Study Assistant</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="/assets/binus_logo.png" alt="BINUS University" />
+        <div><strong>Smart Study Assistant</strong><span>Asisten belajar dokumen PDF dan PowerPoint</span></div>
+      </div>
+      <button id="logoutBtn" class="ghost hidden" type="button">Logout</button>
+    </header>
+    <main class="layout">
+      <section id="authView" class="auth-panel">
+        <div class="auth-copy">
+          <h1>Belajar dari dokumen sendiri, bukan dari internet.</h1>
+          <p>Upload PDF atau PowerPoint, lalu gunakan chat, ringkasan, flashcard, dan quiz berbasis konteks dokumen.</p>
+        </div>
+        <form id="authForm" class="panel">
+          <div class="tabs">
+            <button id="loginTab" class="tab active" type="button">Login</button>
+            <button id="registerTab" class="tab" type="button">Register</button>
+          </div>
+          <label id="nameField" class="hidden">Nama<input id="nameInput" autocomplete="name" /></label>
+          <label>Email<input id="emailInput" type="email" autocomplete="email" required /></label>
+          <label>Password<input id="passwordInput" type="password" minlength="8" required /></label>
+          <button id="authSubmit" class="primary" type="submit">Login</button>
+          <p id="authMessage" class="message"></p>
+        </form>
+      </section>
+      <section id="appView" class="app-grid hidden">
+        <aside class="sidebar">
+          <div class="panel">
+            <div class="section-title"><h2>Dokumen</h2><span id="userLabel"></span></div>
+            <form id="uploadForm" class="upload-box">
+              <input id="fileInput" type="file" accept=".pdf,.ppt,.pptx" required />
+              <label class="toggle-row" for="vlmToggle">
+                <input id="vlmToggle" type="checkbox" />
+                <span>
+                  <strong>Analisis gambar</strong>
+                  <small>Aktifkan untuk membaca diagram, tabel gambar, dan ilustrasi dalam dokumen.</small>
+                </span>
+              </label>
+              <button class="primary" type="submit">Upload & Proses</button>
+              <small>PDF, PPT, PPTX. Mode analisis gambar bisa diatur sebelum upload.</small>
+            </form>
+            <div id="documentsList" class="doc-list"></div>
+          </div>
+          <div class="panel activity-panel">
+            <h2>Aktivitas</h2>
+            <div id="activityList" class="activity-list"></div>
+          </div>
+        </aside>
+        <section class="workspace">
+          <div class="panel document-header">
+            <div>
+              <h2 id="selectedTitle">Pilih dokumen</h2>
+              <p id="selectedMeta">Upload dokumen dulu untuk mulai chat.</p>
+            </div>
+            <div class="actions">
+              <button id="progressBtn" type="button" disabled>Progress</button>
+              <button id="summaryBtn" type="button" disabled>Ringkasan</button>
+              <button id="flashcardBtn" type="button" disabled>Flashcard</button>
+              <button id="quizBtn" type="button" disabled>Quiz</button>
+            </div>
+          </div>
+          <div class="work-columns">
+            <section class="panel chat-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>Chat Dokumen</h2>
+                  <p id="chatHint">Riwayat tanya jawab akan tampil setelah dokumen dipilih.</p>
+                </div>
+              </div>
+              <div id="chatLog" class="chat-log"></div>
+              <form id="chatForm" class="chat-form">
+                <textarea id="questionInput" rows="3" placeholder="Tanya isi dokumen..." required></textarea>
+                <button class="primary" type="submit" disabled id="chatSubmit">Kirim</button>
+              </form>
+            </section>
+            <section class="panel output-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>Hasil Belajar</h2>
+                  <p id="outputSubtitle">Pilih dokumen untuk melihat progress belajar.</p>
+                </div>
+              </div>
+              <div id="outputContent" class="output-content"><p class="muted">Ringkasan, flashcard, dan quiz akan tampil di sini.</p></div>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
