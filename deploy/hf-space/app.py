@@ -17,7 +17,6 @@ import faiss
 import gradio as gr
 import numpy as np
 import pdfplumber
-import spaces
 from huggingface_hub import InferenceClient
 from pptx import Presentation
 from sentence_transformers import SentenceTransformer
@@ -35,6 +34,7 @@ _documents: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _documents_lock = threading.RLock()
 _embedding_models: dict[str, SentenceTransformer] = {}
 _embedding_lock = threading.Lock()
+_encoding_lock = threading.Lock()
 
 
 def _clean(value: Any) -> str:
@@ -108,6 +108,13 @@ def _normalize(vectors: Any) -> np.ndarray:
     return (array / norms).astype("float32")
 
 
+def _encode(texts: list[str]) -> np.ndarray:
+    # CPU is available even when the shared ZeroGPU worker cannot start.
+    # Serialize encoding and use small batches to bound peak model memory.
+    with _encoding_lock:
+        return _normalize(_model("cpu").encode(texts, batch_size=2, show_progress_bar=False))
+
+
 def _prune(now: float | None = None) -> None:
     current = now or time.time()
     SESSION_ROOT.mkdir(parents=True, exist_ok=True)
@@ -167,12 +174,11 @@ def _error(exc: Exception) -> dict[str, Any]:
     return {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
 
 
-@spaces.GPU
 def prepare_document(file_path: str, original_filename: str = "") -> dict[str, Any]:
     try:
         sections, kind = _extract_sections(file_path)
         chunks = _chunks(sections)
-        embeddings = _normalize(_model("cuda").encode([item["content"] for item in chunks], batch_size=8, show_progress_bar=False))
+        embeddings = _encode([item["content"] for item in chunks])
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
         identifier, now = uuid.uuid4().hex, time.time()
@@ -191,7 +197,7 @@ def _retrieve(document_id: str, question: str) -> tuple[dict[str, Any], list[dic
     item, query = _document(document_id), _clean(question)
     if not query:
         raise ValueError("Enter a question first.")
-    embedding = _normalize(_model("cpu").encode([query], show_progress_bar=False))
+    embedding = _encode([query])
     scores, positions = item["index"].search(embedding, min(TOP_K, len(item["chunks"])))
     sources = []
     for position, score in zip(positions[0], scores[0]):
@@ -334,7 +340,7 @@ Prepare a text-based PDF or PPTX once, then reuse its BGE-M3 embeddings for grou
 
 > Files are temporary, expire after 45 minutes of inactivity, and may disappear when the Space restarts. Do not upload confidential, sensitive, or personally identifiable information. Limits: 15 MB, 60 PDF pages, or 60 PowerPoint slides.
 """)
-    upload = gr.File(label="PDF or PPTX", file_types=["file"], type="filepath")
+    upload = gr.File(label="PDF or PPTX", file_types=[".pdf", ".pptx"], type="filepath")
     original_filename = gr.Textbox(label="Original filename")
     document_id = gr.Textbox(label="Temporary document ID")
     question = gr.Textbox(label="Question")
