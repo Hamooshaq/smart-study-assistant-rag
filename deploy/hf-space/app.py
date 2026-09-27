@@ -353,7 +353,9 @@ Prepare a text-based PDF or PPTX once, then reuse its BGE-M3 embeddings for grou
 
 > Files are temporary, expire after 45 minutes of inactivity, and may disappear when the Space restarts. Do not upload confidential, sensitive, or personally identifiable information. Limits: 15 MB, 60 PDF pages, or 60 PowerPoint slides.
 """)
-    upload = gr.File(label="PDF or PPTX", file_types=[".pdf", ".pptx"], type="filepath")
+    # API clients can upload Blobs without an extension; validate file signatures
+    # in _extract_sections instead of rejecting valid PDF/PPTX uploads here.
+    upload = gr.File(label="PDF or PPTX", file_types=["file"], type="filepath")
     original_filename = gr.Textbox(label="Original filename")
     document_id = gr.Textbox(label="Temporary document ID")
     question = gr.Textbox(label="Question")
