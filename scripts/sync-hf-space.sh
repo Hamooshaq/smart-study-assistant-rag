@@ -13,6 +13,8 @@ rsync -av --delete \
   --exclude="README.md" \
   --exclude=".kilo" \
   --exclude=".DS_Store" \
+  --exclude="__pycache__" \
+  --exclude="*.pyc" \
   "$SOURCE" "$TARGET"
 
 echo ""

@@ -1,5 +1,7 @@
 import os
 import re
+import tempfile
+
 from functools import lru_cache
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import pdfplumber
 import spaces
 
 from huggingface_hub import InferenceClient
+from pptx import Presentation
 from sentence_transformers import SentenceTransformer
 
 
@@ -64,6 +67,74 @@ def extract_pdf_sections():
 
     return sections
 
+def extract_uploaded_sections(file_path):
+    if not file_path:
+        raise ValueError("Please upload a document first.")
+
+    path = Path(file_path)
+    extension = path.suffix.lower()
+
+    sections = []
+
+    if extension == ".pdf":
+        with pdfplumber.open(path) as pdf:
+            for page_number, page in enumerate(
+                pdf.pages,
+                start=1,
+            ):
+                text = (page.extract_text() or "").strip()
+
+                if text:
+                    sections.append(
+                        {
+                            "text": text,
+                            "page_number": page_number,
+                            "slide_number": None,
+                            "source_label": f"Page {page_number}",
+                            "source_type": "pdf",
+                        }
+                    )
+
+    elif extension == ".pptx":
+        presentation = Presentation(str(path))
+
+        for slide_number, slide in enumerate(
+            presentation.slides,
+            start=1,
+        ):
+            texts = []
+
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    text = shape.text.strip()
+
+                    if text:
+                        texts.append(text)
+
+            combined_text = "\n".join(texts).strip()
+
+            if combined_text:
+                sections.append(
+                    {
+                        "text": combined_text,
+                        "page_number": None,
+                        "slide_number": slide_number,
+                        "source_label": f"Slide {slide_number}",
+                        "source_type": "pptx",
+                    }
+                )
+
+    else:
+        raise ValueError(
+            "Unsupported file type. Please upload a PDF or PPTX file."
+        )
+
+    if not sections:
+        raise ValueError(
+            "The uploaded document does not contain extractable text."
+        )
+
+    return sections
 
 # =========================================================
 # CHUNKING
@@ -146,6 +217,34 @@ def build_sample_chunks():
 
     return chunks
 
+def build_uploaded_chunks(file_path):
+    sections = extract_uploaded_sections(file_path)
+
+    chunks = []
+
+    for section in sections:
+        parts = recursive_split_text(
+            section["text"]
+        )
+
+        for part in parts:
+            chunks.append(
+                {
+                    "id": len(chunks),
+                    "source": section["source_label"],
+                    "source_type": section["source_type"],
+                    "page_number": section["page_number"],
+                    "slide_number": section["slide_number"],
+                    "content": part,
+                }
+            )
+
+    if not chunks:
+        raise ValueError(
+            "No chunks were generated from the uploaded document."
+        )
+
+    return chunks
 
 # =========================================================
 # EMBEDDING
@@ -178,6 +277,69 @@ def normalize(vectors):
         vectors / norms
     ).astype("float32")
 
+def retrieve_from_chunks(question, chunks):
+    question = (question or "").strip()
+
+    if not question:
+        raise ValueError("Please enter a question.")
+
+    if not chunks:
+        raise ValueError("No document chunks are available.")
+
+    model = load_embedding_model()
+
+    document_embeddings = model.encode(
+        [chunk["content"] for chunk in chunks],
+        batch_size=8,
+        show_progress_bar=False,
+    )
+
+    document_embeddings = normalize(
+        document_embeddings
+    )
+
+    index = faiss.IndexFlatIP(
+        document_embeddings.shape[1]
+    )
+
+    index.add(
+        document_embeddings
+    )
+
+    query_embedding = model.encode(
+        [question],
+        show_progress_bar=False,
+    )
+
+    query_embedding = normalize(
+        query_embedding
+    )
+
+    scores, positions = index.search(
+        query_embedding,
+        min(TOP_K, len(chunks)),
+    )
+
+    retrieved = []
+
+    for position, score in zip(
+        positions[0],
+        scores[0],
+    ):
+        if position < 0:
+            continue
+
+        chunk = chunks[int(position)]
+
+        retrieved.append(
+            {
+                "source": chunk["source"],
+                "content": chunk["content"],
+                "score": float(score),
+            }
+        )
+
+    return retrieved
 
 # =========================================================
 # RETRIEVAL
@@ -189,87 +351,15 @@ def retrieve_context(question):
     question = (question or "").strip()
 
     if not question:
-        return (
-            "",
-            "Please enter a question.",
-        )
+        return "", "Please enter a question."
 
     try:
         chunks = build_sample_chunks()
-        model = load_embedding_model()
 
-        document_embeddings = model.encode(
-            [
-                chunk["content"]
-                for chunk in chunks
-            ],
-            batch_size=8,
-            show_progress_bar=False,
+        retrieved = retrieve_from_chunks(
+            question,
+            chunks,
         )
-
-        document_embeddings = normalize(
-            document_embeddings
-        )
-
-        index = faiss.IndexFlatIP(
-            document_embeddings.shape[1]
-        )
-
-        index.add(
-            document_embeddings
-        )
-
-        query_embedding = model.encode(
-            [question],
-            show_progress_bar=False,
-        )
-
-        query_embedding = normalize(
-            query_embedding
-        )
-
-        scores, positions = index.search(
-            query_embedding,
-            min(
-                TOP_K,
-                len(chunks),
-            ),
-        )
-
-        retrieved = []
-        source_blocks = []
-
-        for rank, (position, score) in enumerate(
-            zip(
-                positions[0],
-                scores[0],
-            ),
-            start=1,
-        ):
-            if position < 0:
-                continue
-
-            chunk = chunks[
-                int(position)
-            ]
-
-            item = {
-                "source": chunk["source"],
-                "content": chunk["content"],
-                "score": float(score),
-            }
-
-            retrieved.append(item)
-
-            source_blocks.append(
-                f"""
-### {rank}. {item["source"]}
-
-**Similarity:** `{item["score"]:.4f}`
-
-{item["content"]}
-"""
-            )
 
         context = "\n\n".join(
             (
@@ -284,6 +374,22 @@ def retrieve_context(question):
             )
         )
 
+        source_blocks = []
+
+        for rank, item in enumerate(
+            retrieved,
+            start=1,
+        ):
+            source_blocks.append(
+                f"""
+### {rank}. {item["source"]}
+
+**Similarity:** `{item["score"]:.4f}`
+
+{item["content"]}
+"""
+            )
+
         sources_markdown = "\n".join(
             source_blocks
         )
@@ -294,14 +400,79 @@ def retrieve_context(question):
         )
 
     except Exception as exc:
-        error = (
-            f"Retrieval error: "
-            f"{type(exc).__name__}: {exc}"
+        return (
+            "",
+            (
+                f"Retrieval error: "
+                f"{type(exc).__name__}: {exc}"
+            ),
         )
 
-        return "", error
+@spaces.GPU
+def retrieve_uploaded_context(file_path, question):
+    question = (question or "").strip()
 
+    if not file_path:
+        return "", "Please upload a PDF or PPTX file."
 
+    if not question:
+        return "", "Please enter a question."
+
+    try:
+        chunks = build_uploaded_chunks(file_path)
+
+        retrieved = retrieve_from_chunks(
+            question,
+            chunks,
+        )
+
+        context = "\n\n".join(
+            (
+                f"[Source {index_number}: "
+                f"{item['source']}]\n"
+                f"{item['content']}"
+            )
+            for index_number, item
+            in enumerate(
+                retrieved,
+                start=1,
+            )
+        )
+
+        source_blocks = []
+
+        for rank, item in enumerate(
+            retrieved,
+            start=1,
+        ):
+            source_blocks.append(
+                f"""
+### {rank}. {item["source"]}
+
+**Similarity:** `{item["score"]:.4f}`
+
+{item["content"]}
+"""
+            )
+
+        sources_markdown = "\n".join(
+            source_blocks
+        )
+
+        return (
+            context,
+            sources_markdown,
+        )
+
+    except Exception as exc:
+        return (
+            "",
+            (
+                f"Retrieval error: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+    
 # =========================================================
 # GENERATION
 # Cloud adaptation:
@@ -468,6 +639,43 @@ This is a cloud demo adaptation of the original local Smart Study Assistant.
         inputs=question,
     )
 
+    gr.Markdown("---")
+
+    gr.Markdown(
+        """
+## Upload Your Own Document
+
+Upload a text-based PDF or PPTX and ask questions using the same
+BGE-M3 + FAISS retrieval pipeline.
+"""
+    )
+
+    uploaded_file = gr.File(
+        label="Upload PDF or PPTX",
+        file_types=[".pdf", ".pptx"],
+        type="filepath",
+    )
+
+    uploaded_question = gr.Textbox(
+        label="Ask your uploaded document",
+        placeholder="Example: What is the main topic of this document?",
+    )
+
+    uploaded_ask_button = gr.Button(
+        "Ask Uploaded Document",
+        variant="secondary",
+    )
+
+    gr.Markdown("### Answer")
+
+    uploaded_answer_output = gr.Markdown()
+
+    gr.Markdown("### Retrieved Sources")
+
+    uploaded_sources_output = gr.Markdown()
+
+    uploaded_context_state = gr.State("")
+
     retrieval_event = (
         ask_button.click(
             fn=retrieve_context,
@@ -480,6 +688,28 @@ This is a cloud demo adaptation of the original local Smart Study Assistant.
         )
     )
 
+    uploaded_retrieval_event = uploaded_ask_button.click(
+        fn=retrieve_uploaded_context,
+        inputs=[
+            uploaded_file,
+            uploaded_question,
+        ],
+        outputs=[
+            uploaded_context_state,
+            uploaded_sources_output,
+        ],
+        api_name="retrieve_uploaded",
+    )
+
+    uploaded_retrieval_event.then(
+        fn=generate_answer,
+        inputs=[
+            uploaded_question,
+            uploaded_context_state,
+        ],
+        outputs=uploaded_answer_output,
+        api_name="generate_uploaded",
+    )
     retrieval_event.then(
         fn=generate_answer,
         inputs=[
