@@ -17,6 +17,7 @@ import faiss
 import gradio as gr
 import numpy as np
 import pdfplumber
+import spaces
 from huggingface_hub import InferenceClient
 from pptx import Presentation
 from sentence_transformers import SentenceTransformer
@@ -108,10 +109,22 @@ def _normalize(vectors: Any) -> np.ndarray:
     return (array / norms).astype("float32")
 
 
+@spaces.GPU(duration=60)
+def _encode_gpu(texts: list[str]) -> np.ndarray:
+    return _normalize(_model("cuda").encode(texts, batch_size=8, show_progress_bar=False))
+
+
 def _encode(texts: list[str]) -> np.ndarray:
     # CPU is available even when the shared ZeroGPU worker cannot start.
     # Serialize encoding and use small batches to bound peak model memory.
     with _encoding_lock:
+        # Keep optional acceleration registered for ZeroGPU-hosted Spaces.
+        # CPU is the default; a GPU worker failure still falls back safely.
+        if os.environ.get("EMBEDDING_DEVICE", "cpu") == "cuda":
+            try:
+                return _encode_gpu(texts)
+            except Exception:
+                pass
         return _normalize(_model("cpu").encode(texts, batch_size=2, show_progress_bar=False))
 
 
