@@ -29,6 +29,12 @@ CHUNK_SIZE = 500
 CHUNK_OVERLAP = 75
 TOP_K = 3
 
+MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+MAX_PDF_PAGES = 60
+MAX_PPTX_SLIDES = 60
+
 
 # =========================================================
 # PDF EXTRACTION
@@ -72,12 +78,25 @@ def extract_uploaded_sections(file_path):
         raise ValueError("Please upload a document first.")
 
     path = Path(file_path)
+
+    file_size = path.stat().st_size
+
+    if file_size > MAX_FILE_SIZE_BYTES:
+        raise ValueError(
+            f"File is too large. Maximum file size is "
+            f"{MAX_FILE_SIZE_MB} MB."
+        )
     extension = path.suffix.lower()
 
     sections = []
 
     if extension == ".pdf":
         with pdfplumber.open(path) as pdf:
+            if len(pdf.pages) > MAX_PDF_PAGES:
+                raise ValueError(
+                    f"PDF has too many pages. Maximum is "
+                    f"{MAX_PDF_PAGES} pages."
+                )
             for page_number, page in enumerate(
                 pdf.pages,
                 start=1,
@@ -97,6 +116,12 @@ def extract_uploaded_sections(file_path):
 
     elif extension == ".pptx":
         presentation = Presentation(str(path))
+
+        if len(presentation.slides) > MAX_PPTX_SLIDES:
+            raise ValueError(
+                f"PPTX has too many slides. Maximum is "
+                f"{MAX_PPTX_SLIDES} slides."
+            )
 
         for slide_number, slide in enumerate(
             presentation.slides,
@@ -622,7 +647,7 @@ def retrieve_uploaded_context(file_path, question):
                 f"{type(exc).__name__}: {exc}"
             ),
         )
-    
+
 # =========================================================
 # GENERATION
 # Cloud adaptation:
@@ -742,8 +767,8 @@ This is a cloud demo adaptation of the original local Smart Study Assistant.
 
     gr.Markdown(
         """
-**Sample material:** Machine Learning Notes  
-**Document type:** PDF  
+**Sample material:** Machine Learning Notes
+**Document type:** PDF
 **Retrieval:** BGE-M3 + FAISS IndexFlatIP
 """
     )
@@ -797,6 +822,11 @@ This is a cloud demo adaptation of the original local Smart Study Assistant.
 
 Upload a text-based PDF or PPTX and ask questions using the same
 BGE-M3 + FAISS retrieval pipeline.
+
+> **Privacy notice:** Uploaded files are processed temporarily for this demo.
+> Do not upload confidential, sensitive, or personally identifiable information.
+
+**Limits:** Maximum 15 MB • PDF up to 60 pages • PPTX up to 60 slides
 """
     )
 
