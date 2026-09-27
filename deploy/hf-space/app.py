@@ -86,7 +86,17 @@ def extract_uploaded_sections(file_path):
             f"File is too large. Maximum file size is "
             f"{MAX_FILE_SIZE_MB} MB."
         )
-    extension = path.suffix.lower()
+    with path.open("rb") as file:
+        signature = file.read(4)
+
+    if signature.startswith(b"%PDF"):
+        extension = ".pdf"
+    elif signature.startswith(b"PK"):
+        extension = ".pptx"
+    else:
+        raise ValueError(
+            "Unsupported file type. Please upload a PDF or PPTX file."
+        )
 
     sections = []
 
