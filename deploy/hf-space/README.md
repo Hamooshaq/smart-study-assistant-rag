@@ -2,7 +2,7 @@
 title: Smart Study Assistant Demo
 emoji: 📚
 colorFrom: blue
-colorTo: cyan
+colorTo: blue
 sdk: gradio
 sdk_version: 6.28.0
 app_file: app.py
