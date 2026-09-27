@@ -1,936 +1,313 @@
+"""Stable, ephemeral cloud API for the Smart Study Assistant portfolio demo."""
+
+from __future__ import annotations
+
+import json
 import os
 import re
-import tempfile
-
-from functools import lru_cache
+import threading
+import time
+import uuid
+from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import faiss
 import gradio as gr
 import numpy as np
 import pdfplumber
 import spaces
-
 from huggingface_hub import InferenceClient
 from pptx import Presentation
 from sentence_transformers import SentenceTransformer
 
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-SAMPLE_PDF = Path("samples/machine-learning-notes.pdf")
-
 EMBEDDING_MODEL = "BAAI/bge-m3"
 GENERATION_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+CHUNK_SIZE, CHUNK_OVERLAP, TOP_K = 500, 75, 3
+MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
+MAX_PDF_PAGES, MAX_PPTX_SLIDES = 60, 60
+MAX_DOCUMENTS, DOCUMENT_TTL_SECONDS = 12, 45 * 60
+MAX_GENERATION_CONTEXT_CHARS = 28_000
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 75
-TOP_K = 3
-
-MAX_FILE_SIZE_MB = 15
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-
-MAX_PDF_PAGES = 60
-MAX_PPTX_SLIDES = 60
+_documents: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_documents_lock = threading.RLock()
+_embedding_model: SentenceTransformer | None = None
+_embedding_lock = threading.Lock()
 
 
-# =========================================================
-# PDF EXTRACTION
-# Adapted from original project's extraction.py
-# =========================================================
+def _clean(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
-@lru_cache(maxsize=1)
-def extract_pdf_sections():
-    if not SAMPLE_PDF.exists():
-        raise FileNotFoundError(
-            f"Sample PDF not found: {SAMPLE_PDF}"
-        )
 
-    sections = []
-
-    with pdfplumber.open(SAMPLE_PDF) as pdf:
-        for page_number, page in enumerate(
-            pdf.pages,
-            start=1,
-        ):
-            text = (page.extract_text() or "").strip()
-
-            if text:
-                sections.append(
-                    {
-                        "text": text,
-                        "page_number": page_number,
-                        "source_label": f"Page {page_number}",
-                    }
-                )
-
-    if not sections:
-        raise ValueError(
-            "The sample PDF does not contain extractable text."
-        )
-
-    return sections
-
-def extract_uploaded_sections(file_path):
+def _extract_sections(file_path: str) -> tuple[list[dict[str, Any]], str]:
     if not file_path:
-        raise ValueError("Please upload a document first.")
-
+        raise ValueError("Upload a PDF or PPTX document first.")
     path = Path(file_path)
+    if not path.is_file():
+        raise ValueError("The uploaded file is no longer available. Upload it again.")
+    if path.stat().st_size > MAX_FILE_SIZE_BYTES:
+        raise ValueError("The file exceeds the 15 MB upload limit.")
+    with path.open("rb") as stream:
+        signature = stream.read(8)
 
-    file_size = path.stat().st_size
-
-    if file_size > MAX_FILE_SIZE_BYTES:
-        raise ValueError(
-            f"File is too large. Maximum file size is "
-            f"{MAX_FILE_SIZE_MB} MB."
-        )
-    with path.open("rb") as file:
-        signature = file.read(4)
-
+    sections: list[dict[str, Any]] = []
     if signature.startswith(b"%PDF"):
-        extension = ".pdf"
-    elif signature.startswith(b"PK"):
-        extension = ".pptx"
-    else:
-        raise ValueError(
-            "Unsupported file type. Please upload a PDF or PPTX file."
-        )
-
-    sections = []
-
-    if extension == ".pdf":
+        kind = "pdf"
         with pdfplumber.open(path) as pdf:
             if len(pdf.pages) > MAX_PDF_PAGES:
-                raise ValueError(
-                    f"PDF has too many pages. Maximum is "
-                    f"{MAX_PDF_PAGES} pages."
-                )
-            for page_number, page in enumerate(
-                pdf.pages,
-                start=1,
-            ):
+                raise ValueError(f"PDFs are limited to {MAX_PDF_PAGES} pages.")
+            for number, page in enumerate(pdf.pages, 1):
                 text = (page.extract_text() or "").strip()
-
                 if text:
-                    sections.append(
-                        {
-                            "text": text,
-                            "page_number": page_number,
-                            "slide_number": None,
-                            "source_label": f"Page {page_number}",
-                            "source_type": "pdf",
-                        }
-                    )
-
-    elif extension == ".pptx":
+                    sections.append({"text": text, "source_label": f"Page {number}", "page_number": number, "slide_number": None})
+    elif signature.startswith(b"PK"):
+        kind = "pptx"
         presentation = Presentation(str(path))
-
         if len(presentation.slides) > MAX_PPTX_SLIDES:
-            raise ValueError(
-                f"PPTX has too many slides. Maximum is "
-                f"{MAX_PPTX_SLIDES} slides."
-            )
-
-        for slide_number, slide in enumerate(
-            presentation.slides,
-            start=1,
-        ):
-            texts = []
-
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    text = shape.text.strip()
-
-                    if text:
-                        texts.append(text)
-
-            combined_text = "\n".join(texts).strip()
-
-            if combined_text:
-                sections.append(
-                    {
-                        "text": combined_text,
-                        "page_number": None,
-                        "slide_number": slide_number,
-                        "source_label": f"Slide {slide_number}",
-                        "source_type": "pptx",
-                    }
-                )
-
+            raise ValueError(f"PowerPoint files are limited to {MAX_PPTX_SLIDES} slides.")
+        for number, slide in enumerate(presentation.slides, 1):
+            text = "\n".join(shape.text.strip() for shape in slide.shapes if hasattr(shape, "text") and shape.text and shape.text.strip())
+            if text:
+                sections.append({"text": text, "source_label": f"Slide {number}", "page_number": None, "slide_number": number})
     else:
-        raise ValueError(
-            "Unsupported file type. Please upload a PDF or PPTX file."
-        )
-
+        raise ValueError("Unsupported file. Upload a valid PDF or PPTX document.")
     if not sections:
-        raise ValueError(
-            "The uploaded document does not contain extractable text."
-        )
-
-    return sections
-
-# =========================================================
-# CHUNKING
-# Adapted from original project's chunking.py
-# =========================================================
-
-def recursive_split_text(
-    text,
-    chunk_size=CHUNK_SIZE,
-    overlap=CHUNK_OVERLAP,
-):
-    cleaned = re.sub(
-        r"\s+",
-        " ",
-        text or "",
-    ).strip()
-
-    if not cleaned:
-        return []
-
-    words = cleaned.split()
-
-    if len(words) <= chunk_size:
-        return [cleaned]
-
-    step = max(
-        1,
-        chunk_size - overlap,
-    )
-
-    chunks = []
-
-    for start in range(
-        0,
-        len(words),
-        step,
-    ):
-        part = words[
-            start:start + chunk_size
-        ]
-
-        if not part:
-            break
-
-        chunks.append(
-            " ".join(part)
-        )
-
-        if start + chunk_size >= len(words):
-            break
-
-    return chunks
+        raise ValueError("No extractable text was found in this document.")
+    return sections, kind
 
 
-@lru_cache(maxsize=1)
-def build_sample_chunks():
-    sections = extract_pdf_sections()
+def _split(text: str) -> list[str]:
+    words = _clean(text).split()
+    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+    return [" ".join(words[start : start + CHUNK_SIZE]) for start in range(0, len(words), step)]
 
-    chunks = []
 
+def _chunks(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
     for section in sections:
-        parts = recursive_split_text(
-            section["text"]
-        )
-
-        for part in parts:
-            chunks.append(
-                {
-                    "id": len(chunks),
-                    "source": section["source_label"],
-                    "page_number": section["page_number"],
-                    "content": part,
-                }
-            )
-
-    if not chunks:
-        raise ValueError(
-            "No chunks were generated from the PDF."
-        )
-
-    return chunks
-
-def build_uploaded_chunks(file_path):
-    sections = extract_uploaded_sections(file_path)
-
-    chunks = []
-
-    for section in sections:
-        parts = recursive_split_text(
-            section["text"]
-        )
-
-        for part in parts:
-            chunks.append(
-                {
-                    "id": len(chunks),
-                    "source": section["source_label"],
-                    "source_type": section["source_type"],
-                    "page_number": section["page_number"],
-                    "slide_number": section["slide_number"],
-                    "content": part,
-                }
-            )
-
-    if not chunks:
-        raise ValueError(
-            "No chunks were generated from the uploaded document."
-        )
-
-    return chunks
-
-# =========================================================
-# EMBEDDING
-# Same pattern as original project's embedding.py
-# =========================================================
-
-@lru_cache(maxsize=1)
-def load_embedding_model():
-    return SentenceTransformer(
-        EMBEDDING_MODEL,
-        device="cuda",
-    )
+        for content in _split(section["text"]):
+            result.append({"id": len(result), "content": content, "source_label": section["source_label"], "page_number": section["page_number"], "slide_number": section["slide_number"]})
+    if not result:
+        raise ValueError("No searchable chunks could be created from this document.")
+    return result
 
 
-def normalize(vectors):
-    vectors = np.asarray(
-        vectors,
-        dtype="float32",
-    )
+def _model() -> SentenceTransformer:
+    global _embedding_model
+    with _embedding_lock:
+        if _embedding_model is None:
+            _embedding_model = SentenceTransformer(EMBEDDING_MODEL, device="cuda")
+    return _embedding_model
 
-    norms = np.linalg.norm(
-        vectors,
-        axis=1,
-        keepdims=True,
-    )
 
+def _normalize(vectors: Any) -> np.ndarray:
+    array = np.asarray(vectors, dtype="float32")
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
     norms[norms == 0] = 1
+    return (array / norms).astype("float32")
 
-    return (
-        vectors / norms
-    ).astype("float32")
 
-@spaces.GPU
-def prepare_uploaded_document(file_path):
-    if not file_path:
-        return None, "Please upload a PDF or PPTX file."
+def _prune(now: float | None = None) -> None:
+    current = now or time.time()
+    with _documents_lock:
+        for key in [key for key, value in _documents.items() if current - value["last_accessed"] > DOCUMENT_TTL_SECONDS]:
+            _documents.pop(key, None)
+        while len(_documents) >= MAX_DOCUMENTS:
+            _documents.popitem(last=False)
 
-    try:
-        chunks = build_uploaded_chunks(file_path)
 
-        model = load_embedding_model()
+def _document(document_id: str) -> dict[str, Any]:
+    identifier = _clean(document_id)
+    _prune()
+    with _documents_lock:
+        item = _documents.get(identifier)
+        if not item:
+            raise ValueError("This temporary document session expired. Prepare the document again.")
+        item["last_accessed"] = time.time()
+        _documents.move_to_end(identifier)
+        return item
 
-        document_embeddings = model.encode(
-            [chunk["content"] for chunk in chunks],
-            batch_size=8,
-            show_progress_bar=False,
-        )
 
-        document_embeddings = normalize(
-            document_embeddings
-        )
+def _error(exc: Exception) -> dict[str, Any]:
+    return {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
 
-        prepared_document = {
-            "chunks": chunks,
-            "embeddings": document_embeddings,
-            "filename": Path(file_path).name,
-        }
-
-        status = (
-            f"Ready: **{Path(file_path).name}**  \n"
-            f"Parsed and indexed **{len(chunks)} chunks**."
-        )
-
-        return prepared_document, status
-
-    except Exception as exc:
-        return (
-            None,
-            (
-                f"Document preparation error: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
 
 @spaces.GPU
-def retrieve_prepared_document(question, prepared_document):
-    question = (question or "").strip()
-
-    if not question:
-        return "", "Please enter a question."
-
-    if not prepared_document:
-        return "", "Please prepare a document first."
-
+def prepare_document(file_path: str) -> dict[str, Any]:
     try:
-        chunks = prepared_document["chunks"]
-
-        document_embeddings = np.asarray(
-            prepared_document["embeddings"],
-            dtype="float32",
-        )
-
-        model = load_embedding_model()
-
-        query_embedding = model.encode(
-            [question],
-            show_progress_bar=False,
-        )
-
-        query_embedding = normalize(
-            query_embedding
-        )
-
-        index = faiss.IndexFlatIP(
-            document_embeddings.shape[1]
-        )
-
-        index.add(
-            document_embeddings
-        )
-
-        scores, positions = index.search(
-            query_embedding,
-            min(TOP_K, len(chunks)),
-        )
-
-        retrieved = []
-
-        for position, score in zip(
-            positions[0],
-            scores[0],
-        ):
-            if position < 0:
-                continue
-
-            chunk = chunks[int(position)]
-
-            retrieved.append(
-                {
-                    "source": chunk["source"],
-                    "content": chunk["content"],
-                    "score": float(score),
-                }
-            )
-
-        context = "\n\n".join(
-            (
-                f"[Source {index_number}: "
-                f"{item['source']}]\n"
-                f"{item['content']}"
-            )
-            for index_number, item
-            in enumerate(
-                retrieved,
-                start=1,
-            )
-        )
-
-        source_blocks = []
-
-        for rank, item in enumerate(
-            retrieved,
-            start=1,
-        ):
-            source_blocks.append(
-                f"""
-### {rank}. {item["source"]}
-
-**Similarity:** `{item["score"]:.4f}`
-
-{item["content"]}
-"""
-            )
-
-        sources_markdown = "\n".join(
-            source_blocks
-        )
-
-        return (
-            context,
-            sources_markdown,
-        )
-
+        sections, kind = _extract_sections(file_path)
+        chunks = _chunks(sections)
+        embeddings = _normalize(_model().encode([item["content"] for item in chunks], batch_size=8, show_progress_bar=False))
+        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index.add(embeddings)
+        identifier, now = uuid.uuid4().hex, time.time()
+        record = {"filename": Path(file_path).name, "document_type": kind, "section_count": len(sections), "chunk_count": len(chunks), "chunks": chunks, "index": index, "last_accessed": now, "quiz": None}
+        _prune(now)
+        with _documents_lock:
+            _documents[identifier] = record
+        return {"ok": True, "document_id": identifier, "filename": record["filename"], "document_type": kind, "section_count": len(sections), "chunk_count": len(chunks), "expires_in_seconds": DOCUMENT_TTL_SECONDS}
     except Exception as exc:
-        return (
-            "",
-            (
-                f"Retrieval error: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
+        return _error(exc)
 
-def retrieve_from_chunks(question, chunks):
-    question = (question or "").strip()
-
-    if not question:
-        raise ValueError("Please enter a question.")
-
-    if not chunks:
-        raise ValueError("No document chunks are available.")
-
-    model = load_embedding_model()
-
-    document_embeddings = model.encode(
-        [chunk["content"] for chunk in chunks],
-        batch_size=8,
-        show_progress_bar=False,
-    )
-
-    document_embeddings = normalize(
-        document_embeddings
-    )
-
-    index = faiss.IndexFlatIP(
-        document_embeddings.shape[1]
-    )
-
-    index.add(
-        document_embeddings
-    )
-
-    query_embedding = model.encode(
-        [question],
-        show_progress_bar=False,
-    )
-
-    query_embedding = normalize(
-        query_embedding
-    )
-
-    scores, positions = index.search(
-        query_embedding,
-        min(TOP_K, len(chunks)),
-    )
-
-    retrieved = []
-
-    for position, score in zip(
-        positions[0],
-        scores[0],
-    ):
-        if position < 0:
-            continue
-
-        chunk = chunks[int(position)]
-
-        retrieved.append(
-            {
-                "source": chunk["source"],
-                "content": chunk["content"],
-                "score": float(score),
-            }
-        )
-
-    return retrieved
-
-# =========================================================
-# RETRIEVAL
-# Same pattern as original FAISS IndexFlatIP retrieval
-# =========================================================
 
 @spaces.GPU
-def retrieve_context(question):
-    question = (question or "").strip()
+def _retrieve(document_id: str, question: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    item, query = _document(document_id), _clean(question)
+    if not query:
+        raise ValueError("Enter a question first.")
+    embedding = _normalize(_model().encode([query], show_progress_bar=False))
+    scores, positions = item["index"].search(embedding, min(TOP_K, len(item["chunks"])))
+    sources = []
+    for position, score in zip(positions[0], scores[0]):
+        if position >= 0:
+            chunk = item["chunks"][int(position)]
+            sources.append({"chunk_id": chunk["id"], "source_label": chunk["source_label"], "page_number": chunk["page_number"], "slide_number": chunk["slide_number"], "score": round(float(score), 4), "excerpt": chunk["content"][:900]})
+    return item, sources
 
-    if not question:
-        return "", "Please enter a question."
 
-    try:
-        chunks = build_sample_chunks()
-
-        retrieved = retrieve_from_chunks(
-            question,
-            chunks,
-        )
-
-        context = "\n\n".join(
-            (
-                f"[Source {index_number}: "
-                f"{item['source']}]\n"
-                f"{item['content']}"
-            )
-            for index_number, item
-            in enumerate(
-                retrieved,
-                start=1,
-            )
-        )
-
-        source_blocks = []
-
-        for rank, item in enumerate(
-            retrieved,
-            start=1,
-        ):
-            source_blocks.append(
-                f"""
-### {rank}. {item["source"]}
-
-**Similarity:** `{item["score"]:.4f}`
-
-{item["content"]}
-"""
-            )
-
-        sources_markdown = "\n".join(
-            source_blocks
-        )
-
-        return (
-            context,
-            sources_markdown,
-        )
-
-    except Exception as exc:
-        return (
-            "",
-            (
-                f"Retrieval error: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
-
-@spaces.GPU
-def retrieve_uploaded_context(file_path, question):
-    question = (question or "").strip()
-
-    if not file_path:
-        return "", "Please upload a PDF or PPTX file."
-
-    if not question:
-        return "", "Please enter a question."
-
-    try:
-        chunks = build_uploaded_chunks(file_path)
-
-        retrieved = retrieve_from_chunks(
-            question,
-            chunks,
-        )
-
-        context = "\n\n".join(
-            (
-                f"[Source {index_number}: "
-                f"{item['source']}]\n"
-                f"{item['content']}"
-            )
-            for index_number, item
-            in enumerate(
-                retrieved,
-                start=1,
-            )
-        )
-
-        source_blocks = []
-
-        for rank, item in enumerate(
-            retrieved,
-            start=1,
-        ):
-            source_blocks.append(
-                f"""
-### {rank}. {item["source"]}
-
-**Similarity:** `{item["score"]:.4f}`
-
-{item["content"]}
-"""
-            )
-
-        sources_markdown = "\n".join(
-            source_blocks
-        )
-
-        return (
-            context,
-            sources_markdown,
-        )
-
-    except Exception as exc:
-        return (
-            "",
-            (
-                f"Retrieval error: "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
-
-# =========================================================
-# GENERATION
-# Cloud adaptation:
-# original local app uses Qwen 2.5 through Ollama.
-# Demo uses hosted Qwen inference.
-# =========================================================
-
-def generate_answer(
-    question,
-    context,
-):
-    question = (question or "").strip()
-    context = (context or "").strip()
-
-    if not question:
-        return "Please enter a question."
-
-    if not context:
-        return (
-            "I could not retrieve enough "
-            "evidence from the document."
-        )
-
-    token = os.environ.get(
-        "HF_TOKEN"
-    )
-
+def _client() -> InferenceClient:
+    token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
-        return (
-            "HF_TOKEN is not configured."
-        )
+        raise RuntimeError("The Space generation service is not configured.")
+    return InferenceClient(provider="auto", api_key=token)
 
+
+def _complete(system: str, prompt: str, max_tokens: int, temperature: float = 0.15) -> str:
+    result = _client().chat.completions.create(model=GENERATION_MODEL, messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], temperature=temperature, max_tokens=max_tokens)
+    answer = result.choices[0].message.content
+    if not answer:
+        raise RuntimeError("The generation model returned an empty response.")
+    return answer.strip()
+
+
+def _evidence(sources: list[dict[str, Any]]) -> str:
+    return "\n\n".join(f"[Source {number}: {source['source_label']}]\n{source['excerpt']}" for number, source in enumerate(sources, 1))
+
+
+def ask_document(document_id: str, question: str) -> dict[str, Any]:
     try:
-        client = InferenceClient(
-            provider="auto",
-            api_key=token,
-        )
-
-        completion = (
-            client.chat.completions.create(
-                model=GENERATION_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a study assistant. "
-                            "Answer ONLY using the provided "
-                            "document context. "
-                            "Do not use outside knowledge. "
-                            "If the document does not contain "
-                            "enough information, say that the "
-                            "information was not found in the "
-                            "document. "
-                            "Keep the answer concise and clear. "
-                            "Mention relevant page labels."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Document context:\n\n"
-                            f"{context}\n\n"
-                            f"Question:\n"
-                            f"{question}"
-                        ),
-                    },
-                ],
-                temperature=0.2,
-                max_tokens=300,
-            )
-        )
-
-        answer = (
-            completion
-            .choices[0]
-            .message
-            .content
-        )
-
-        if not answer:
-            return (
-                "The generation model "
-                "returned an empty response."
-            )
-
-        return answer
-
+        _, sources = _retrieve(document_id, question)
+        answer = _complete("Answer only from the document evidence. Never use outside knowledge. If evidence is insufficient, say it was not found. Be concise and cite page or slide labels.", f"Evidence:\n{_evidence(sources)}\n\nQuestion: {_clean(question)}", 500)
+        return {"ok": True, "answer": answer, "sources": sources}
     except Exception as exc:
-        return (
-            "Generation error:\n\n"
-            f"`{type(exc).__name__}: "
-            f"{str(exc)}`"
-        )
+        return _error(exc)
 
 
-# =========================================================
-# UI
-# =========================================================
+def _context(item: dict[str, Any]) -> str:
+    return "\n\n".join(f"[{chunk['source_label']}]\n{chunk['content']}" for chunk in item["chunks"])[:MAX_GENERATION_CONTEXT_CHARS]
 
-with gr.Blocks(
-    title="Smart Study Assistant Demo"
-) as demo:
 
-    gr.Markdown(
-        """
-# Smart Study Assistant — Live RAG Demo
+def summarize_document(document_id: str) -> dict[str, Any]:
+    try:
+        summary = _complete("Create a clear study summary using only the document. Use short headings and bullets, preserve page or slide provenance, and add no facts.", f"Document:\n{_context(_document(document_id))}", 900)
+        return {"ok": True, "summary": summary}
+    except Exception as exc:
+        return _error(exc)
 
-Ask questions about a real sample PDF.
 
-### Live pipeline
+def _json_array(text: str) -> list[dict[str, Any]]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", cleaned)
+        if not match:
+            raise ValueError("The model did not return valid structured study material.")
+        value = json.loads(match.group(0))
+    if not isinstance(value, list):
+        raise ValueError("The generated study material has an invalid format.")
+    return [entry for entry in value if isinstance(entry, dict)]
 
-**PDF → text extraction → 500/75 chunking → BGE-M3 → FAISS → Qwen → answer + page sources**
 
-This is a cloud demo adaptation of the original local Smart Study Assistant.
-"""
-    )
+def generate_flashcards(document_id: str, count: float = 6) -> dict[str, Any]:
+    try:
+        amount, item = max(3, min(10, int(count))), _document(document_id)
+        raw = _complete("Create flashcards using only the document. Return a valid JSON array with no markdown.", f"Document:\n{_context(item)}\n\nCreate {amount} cards as [{'{'}\"question\":\"...\",\"answer\":\"...\",\"source\":\"Page/Slide ...\"{'}'}].", 1100, 0.1)
+        cards = [{"question": _clean(x.get("question")), "answer": _clean(x.get("answer")), "source": _clean(x.get("source"))} for x in _json_array(raw) if _clean(x.get("question")) and _clean(x.get("answer"))]
+        if not cards:
+            raise ValueError("No valid flashcards were generated.")
+        return {"ok": True, "flashcards": cards}
+    except Exception as exc:
+        return _error(exc)
 
-    gr.Markdown(
-        """
-**Sample material:** Machine Learning Notes
-**Document type:** PDF
-**Retrieval:** BGE-M3 + FAISS IndexFlatIP
-"""
-    )
 
-    question = gr.Textbox(
-        label="Ask the sample PDF",
-        placeholder=(
-            "Example: What is overfitting?"
-        ),
-    )
+def _normalize_quiz(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    quiz = []
+    for entry in entries:
+        question = _clean(entry.get("question"))
+        options = [_clean(value) for value in entry.get("options", []) if _clean(value)]
+        answer = _clean(entry.get("answer"))
+        if answer not in options:
+            matches = [option for option in options if option[:1].upper() == answer[:1].upper()]
+            answer = matches[0] if matches else answer
+        if question and len(options) >= 2 and answer in options:
+            quiz.append({"question": question, "options": options, "answer": answer, "source": _clean(entry.get("source"))})
+    return quiz
 
-    ask_button = gr.Button(
-        "Ask the Document",
-        variant="primary",
-    )
 
-    gr.Markdown("## Answer")
+def generate_quiz(document_id: str, count: float = 5) -> dict[str, Any]:
+    try:
+        amount, item = max(3, min(8, int(count))), _document(document_id)
+        raw = _complete("Create a multiple-choice quiz using only the document. Return valid JSON only. The answer must exactly equal one complete option.", f"Document:\n{_context(item)}\n\nCreate {amount} questions as [{'{'}\"question\":\"...\",\"options\":[\"A. ...\",\"B. ...\",\"C. ...\",\"D. ...\"],\"answer\":\"A. ...\",\"source\":\"Page/Slide ...\"{'}'}].", 1500, 0.1)
+        quiz = _normalize_quiz(_json_array(raw))
+        if not quiz:
+            raise ValueError("No valid quiz questions were generated.")
+        item["quiz"] = quiz
+        return {"ok": True, "quiz": [{"id": i, "question": x["question"], "options": x["options"], "source": x["source"]} for i, x in enumerate(quiz)]}
+    except Exception as exc:
+        return _error(exc)
 
-    answer_output = gr.Markdown()
 
-    gr.Markdown(
-        "## Retrieved Sources"
-    )
+def grade_quiz(document_id: str, answers_json: str) -> dict[str, Any]:
+    try:
+        item = _document(document_id)
+        if not item.get("quiz"):
+            raise ValueError("Generate a quiz before submitting answers.")
+        answers = json.loads(answers_json or "[]")
+        if not isinstance(answers, list):
+            raise ValueError("Quiz answers must be a JSON array.")
+        results, correct = [], 0
+        for index, entry in enumerate(item["quiz"]):
+            selected = _clean(answers[index] if index < len(answers) else "")
+            is_correct = bool(selected) and selected.casefold() == entry["answer"].casefold()
+            correct += int(is_correct)
+            results.append({"question": entry["question"], "selected_answer": selected, "correct_answer": entry["answer"], "is_correct": is_correct, "source": entry["source"]})
+        total = len(results)
+        return {"ok": True, "correct": correct, "total": total, "percent": round(correct * 100 / total) if total else 0, "results": results}
+    except Exception as exc:
+        return _error(exc)
 
-    sources_output = gr.Markdown()
 
-    context_state = gr.State("")
+def delete_document(document_id: str) -> dict[str, Any]:
+    with _documents_lock:
+        removed = _documents.pop(_clean(document_id), None)
+    return {"ok": True, "deleted": bool(removed)}
 
-    gr.Examples(
-        examples=[
-            [
-                "What is overfitting?"
-            ],
-            [
-                "How does regularization "
-                "help reduce overfitting?"
-            ],
-            [
-                "Explain the bias-variance "
-                "tradeoff."
-            ],
-        ],
-        inputs=question,
-    )
 
-    gr.Markdown("---")
+with gr.Blocks(title="Smart Study Assistant") as demo:
+    gr.Markdown("""
+# Smart Study Assistant — cloud demo
+Prepare a text-based PDF or PPTX once, then reuse its BGE-M3 embeddings for grounded chat and study tools.
 
-    gr.Markdown(
-        """
-## Upload Your Own Document
+**Pipeline:** PDF/PPTX → 500/75 chunks → normalized BGE-M3 → FAISS IndexFlatIP → hosted Qwen3 → answer + page/slide evidence
 
-Upload a text-based PDF or PPTX and ask questions using the same
-BGE-M3 + FAISS retrieval pipeline.
-
-> **Privacy notice:** Uploaded files are processed temporarily for this demo.
-> Do not upload confidential, sensitive, or personally identifiable information.
-
-**Limits:** Maximum 15 MB • PDF up to 60 pages • PPTX up to 60 slides
-"""
-    )
-
-    uploaded_file = gr.File(
-        label="Upload PDF or PPTX",
-        file_types=["file"],
-        type="filepath",
-    )
-
-    prepare_button = gr.Button(
-        "Prepare Document",
-        variant="secondary",
-    )
-
-    prepare_status = gr.Markdown(
-        "Upload a document, then prepare it before asking questions."
-    )
-
-    prepared_document_state = gr.State(None)
-
-    uploaded_question = gr.Textbox(
-        label="Ask your uploaded document",
-        placeholder="Example: What is the main topic of this document?",
-    )
-
-    uploaded_ask_button = gr.Button(
-        "Ask Uploaded Document",
-        variant="secondary",
-    )
-
-    gr.Markdown("### Answer")
-
-    uploaded_answer_output = gr.Markdown()
-
-    gr.Markdown("### Retrieved Sources")
-
-    uploaded_sources_output = gr.Markdown()
-
-    uploaded_context_state = gr.State("")
-
-    retrieval_event = (
-        ask_button.click(
-            fn=retrieve_context,
-            inputs=question,
-            outputs=[
-                context_state,
-                sources_output,
-            ],
-            api_name="retrieve",
-        )
-    )
-
-    prepare_event = prepare_button.click(
-        fn=prepare_uploaded_document,
-        inputs=uploaded_file,
-        outputs=[
-            prepared_document_state,
-            prepare_status,
-        ],
-        api_name="prepare_uploaded",
-    )
-
-    uploaded_retrieval_event = uploaded_ask_button.click(
-        fn=retrieve_prepared_document,
-        inputs=[
-            uploaded_question,
-            prepared_document_state,
-        ],
-        outputs=[
-            uploaded_context_state,
-            uploaded_sources_output,
-        ],
-        api_name="retrieve_uploaded",
-    )
-
-    uploaded_retrieval_event.then(
-        fn=generate_answer,
-        inputs=[
-            uploaded_question,
-            uploaded_context_state,
-        ],
-        outputs=uploaded_answer_output,
-        api_name="generate_uploaded",
-    )
-    retrieval_event.then(
-        fn=generate_answer,
-        inputs=[
-            question,
-            context_state,
-        ],
-        outputs=answer_output,
-        api_name="generate",
-    )
+> Files are temporary, expire after 45 minutes of inactivity, and may disappear when the Space restarts. Do not upload confidential, sensitive, or personally identifiable information. Limits: 15 MB, 60 PDF pages, or 60 PowerPoint slides.
+""")
+    upload = gr.File(label="PDF or PPTX", file_types=["file"], type="filepath")
+    document_id = gr.Textbox(label="Temporary document ID")
+    question = gr.Textbox(label="Question")
+    answers = gr.Textbox(label="Quiz answers JSON")
+    output = gr.JSON(label="API result")
+    with gr.Row():
+        gr.Button("Prepare", variant="primary").click(prepare_document, upload, output, api_name="prepare_document")
+        gr.Button("Ask").click(ask_document, [document_id, question], output, api_name="ask_document")
+        gr.Button("Summary").click(summarize_document, document_id, output, api_name="summarize_document")
+    with gr.Row():
+        gr.Button("Flashcards").click(generate_flashcards, [document_id, gr.Number(value=6, visible=False)], output, api_name="generate_flashcards")
+        gr.Button("Quiz").click(generate_quiz, [document_id, gr.Number(value=5, visible=False)], output, api_name="generate_quiz")
+        gr.Button("Grade").click(grade_quiz, [document_id, answers], output, api_name="grade_quiz")
+        gr.Button("Delete").click(delete_document, document_id, output, api_name="delete_document")
 
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.queue(default_concurrency_limit=4).launch()
