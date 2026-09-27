@@ -133,7 +133,7 @@ def _error(exc: Exception) -> dict[str, Any]:
 
 
 @spaces.GPU
-def prepare_document(file_path: str) -> dict[str, Any]:
+def prepare_document(file_path: str, original_filename: str = "") -> dict[str, Any]:
     try:
         sections, kind = _extract_sections(file_path)
         chunks = _chunks(sections)
@@ -141,7 +141,8 @@ def prepare_document(file_path: str) -> dict[str, Any]:
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
         identifier, now = uuid.uuid4().hex, time.time()
-        record = {"filename": Path(file_path).name, "document_type": kind, "section_count": len(sections), "chunk_count": len(chunks), "chunks": chunks, "index": index, "last_accessed": now, "quiz": None}
+        filename = Path(_clean(original_filename) or file_path).name
+        record = {"filename": filename, "document_type": kind, "section_count": len(sections), "chunk_count": len(chunks), "chunks": chunks, "index": index, "last_accessed": now, "quiz": None}
         _prune(now)
         with _documents_lock:
             _documents[identifier] = record
@@ -150,7 +151,6 @@ def prepare_document(file_path: str) -> dict[str, Any]:
         return _error(exc)
 
 
-@spaces.GPU
 def _retrieve(document_id: str, question: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     item, query = _document(document_id), _clean(question)
     if not query:
@@ -184,6 +184,7 @@ def _evidence(sources: list[dict[str, Any]]) -> str:
     return "\n\n".join(f"[Source {number}: {source['source_label']}]\n{source['excerpt']}" for number, source in enumerate(sources, 1))
 
 
+@spaces.GPU
 def ask_document(document_id: str, question: str) -> dict[str, Any]:
     try:
         _, sources = _retrieve(document_id, question)
@@ -294,12 +295,13 @@ Prepare a text-based PDF or PPTX once, then reuse its BGE-M3 embeddings for grou
 > Files are temporary, expire after 45 minutes of inactivity, and may disappear when the Space restarts. Do not upload confidential, sensitive, or personally identifiable information. Limits: 15 MB, 60 PDF pages, or 60 PowerPoint slides.
 """)
     upload = gr.File(label="PDF or PPTX", file_types=["file"], type="filepath")
+    original_filename = gr.Textbox(label="Original filename")
     document_id = gr.Textbox(label="Temporary document ID")
     question = gr.Textbox(label="Question")
     answers = gr.Textbox(label="Quiz answers JSON")
     output = gr.JSON(label="API result")
     with gr.Row():
-        gr.Button("Prepare", variant="primary").click(prepare_document, upload, output, api_name="prepare_document")
+        gr.Button("Prepare", variant="primary").click(prepare_document, [upload, original_filename], output, api_name="prepare_document")
         gr.Button("Ask").click(ask_document, [document_id, question], output, api_name="ask_document")
         gr.Button("Summary").click(summarize_document, document_id, output, api_name="summarize_document")
     with gr.Row():
