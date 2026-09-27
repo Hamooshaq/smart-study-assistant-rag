@@ -277,6 +277,156 @@ def normalize(vectors):
         vectors / norms
     ).astype("float32")
 
+@spaces.GPU
+def prepare_uploaded_document(file_path):
+    if not file_path:
+        return None, "Please upload a PDF or PPTX file."
+
+    try:
+        chunks = build_uploaded_chunks(file_path)
+
+        model = load_embedding_model()
+
+        document_embeddings = model.encode(
+            [chunk["content"] for chunk in chunks],
+            batch_size=8,
+            show_progress_bar=False,
+        )
+
+        document_embeddings = normalize(
+            document_embeddings
+        )
+
+        prepared_document = {
+            "chunks": chunks,
+            "embeddings": document_embeddings,
+            "filename": Path(file_path).name,
+        }
+
+        status = (
+            f"Ready: **{Path(file_path).name}**  \n"
+            f"Parsed and indexed **{len(chunks)} chunks**."
+        )
+
+        return prepared_document, status
+
+    except Exception as exc:
+        return (
+            None,
+            (
+                f"Document preparation error: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+@spaces.GPU
+def retrieve_prepared_document(question, prepared_document):
+    question = (question or "").strip()
+
+    if not question:
+        return "", "Please enter a question."
+
+    if not prepared_document:
+        return "", "Please prepare a document first."
+
+    try:
+        chunks = prepared_document["chunks"]
+
+        document_embeddings = np.asarray(
+            prepared_document["embeddings"],
+            dtype="float32",
+        )
+
+        model = load_embedding_model()
+
+        query_embedding = model.encode(
+            [question],
+            show_progress_bar=False,
+        )
+
+        query_embedding = normalize(
+            query_embedding
+        )
+
+        index = faiss.IndexFlatIP(
+            document_embeddings.shape[1]
+        )
+
+        index.add(
+            document_embeddings
+        )
+
+        scores, positions = index.search(
+            query_embedding,
+            min(TOP_K, len(chunks)),
+        )
+
+        retrieved = []
+
+        for position, score in zip(
+            positions[0],
+            scores[0],
+        ):
+            if position < 0:
+                continue
+
+            chunk = chunks[int(position)]
+
+            retrieved.append(
+                {
+                    "source": chunk["source"],
+                    "content": chunk["content"],
+                    "score": float(score),
+                }
+            )
+
+        context = "\n\n".join(
+            (
+                f"[Source {index_number}: "
+                f"{item['source']}]\n"
+                f"{item['content']}"
+            )
+            for index_number, item
+            in enumerate(
+                retrieved,
+                start=1,
+            )
+        )
+
+        source_blocks = []
+
+        for rank, item in enumerate(
+            retrieved,
+            start=1,
+        ):
+            source_blocks.append(
+                f"""
+### {rank}. {item["source"]}
+
+**Similarity:** `{item["score"]:.4f}`
+
+{item["content"]}
+"""
+            )
+
+        sources_markdown = "\n".join(
+            source_blocks
+        )
+
+        return (
+            context,
+            sources_markdown,
+        )
+
+    except Exception as exc:
+        return (
+            "",
+            (
+                f"Retrieval error: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
 def retrieve_from_chunks(question, chunks):
     question = (question or "").strip()
 
@@ -656,6 +806,17 @@ BGE-M3 + FAISS retrieval pipeline.
         type="filepath",
     )
 
+    prepare_button = gr.Button(
+        "Prepare Document",
+        variant="secondary",
+    )
+
+    prepare_status = gr.Markdown(
+        "Upload a document, then prepare it before asking questions."
+    )
+
+    prepared_document_state = gr.State(None)
+
     uploaded_question = gr.Textbox(
         label="Ask your uploaded document",
         placeholder="Example: What is the main topic of this document?",
@@ -688,11 +849,21 @@ BGE-M3 + FAISS retrieval pipeline.
         )
     )
 
+    prepare_event = prepare_button.click(
+        fn=prepare_uploaded_document,
+        inputs=uploaded_file,
+        outputs=[
+            prepared_document_state,
+            prepare_status,
+        ],
+        api_name="prepare_uploaded",
+    )
+
     uploaded_retrieval_event = uploaded_ask_button.click(
-        fn=retrieve_uploaded_context,
+        fn=retrieve_prepared_document,
         inputs=[
-            uploaded_file,
             uploaded_question,
+            prepared_document_state,
         ],
         outputs=[
             uploaded_context_state,
