@@ -832,7 +832,7 @@ BGE-M3 + FAISS retrieval pipeline.
 
     uploaded_file = gr.File(
         label="Upload PDF or PPTX",
-        file_types=[".pdf", ".pptx"],
+        file_types=["file"],
         type="filepath",
     )
 
