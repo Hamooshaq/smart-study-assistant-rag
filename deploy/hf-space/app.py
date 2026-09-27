@@ -18,7 +18,6 @@ import gradio as gr
 import numpy as np
 import pdfplumber
 import spaces
-import torch
 from huggingface_hub import InferenceClient
 from pptx import Presentation
 from sentence_transformers import SentenceTransformer
@@ -34,7 +33,7 @@ SESSION_ROOT = Path("/tmp/smart-study-assistant-sessions")
 
 _documents: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _documents_lock = threading.RLock()
-_embedding_model: SentenceTransformer | None = None
+_embedding_models: dict[str, SentenceTransformer] = {}
 _embedding_lock = threading.Lock()
 
 
@@ -95,13 +94,11 @@ def _chunks(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _model() -> SentenceTransformer:
-    global _embedding_model
+def _model(device: str) -> SentenceTransformer:
     with _embedding_lock:
-        if _embedding_model is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            _embedding_model = SentenceTransformer(EMBEDDING_MODEL, device=device)
-    return _embedding_model
+        if device not in _embedding_models:
+            _embedding_models[device] = SentenceTransformer(EMBEDDING_MODEL, device=device)
+    return _embedding_models[device]
 
 
 def _normalize(vectors: Any) -> np.ndarray:
@@ -175,7 +172,7 @@ def prepare_document(file_path: str, original_filename: str = "") -> dict[str, A
     try:
         sections, kind = _extract_sections(file_path)
         chunks = _chunks(sections)
-        embeddings = _normalize(_model().encode([item["content"] for item in chunks], batch_size=8, show_progress_bar=False))
+        embeddings = _normalize(_model("cuda").encode([item["content"] for item in chunks], batch_size=8, show_progress_bar=False))
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
         identifier, now = uuid.uuid4().hex, time.time()
@@ -194,7 +191,7 @@ def _retrieve(document_id: str, question: str) -> tuple[dict[str, Any], list[dic
     item, query = _document(document_id), _clean(question)
     if not query:
         raise ValueError("Enter a question first.")
-    embedding = _normalize(_model().encode([query], show_progress_bar=False))
+    embedding = _normalize(_model("cpu").encode([query], show_progress_bar=False))
     scores, positions = item["index"].search(embedding, min(TOP_K, len(item["chunks"])))
     sources = []
     for position, score in zip(positions[0], scores[0]):
