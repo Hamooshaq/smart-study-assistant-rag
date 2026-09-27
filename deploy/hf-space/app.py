@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -28,6 +29,7 @@ MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024
 MAX_PDF_PAGES, MAX_PPTX_SLIDES = 60, 60
 MAX_DOCUMENTS, DOCUMENT_TTL_SECONDS = 12, 45 * 60
 MAX_GENERATION_CONTEXT_CHARS = 28_000
+SESSION_ROOT = Path("/tmp/smart-study-assistant-sessions")
 
 _documents: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _documents_lock = threading.RLock()
@@ -109,22 +111,56 @@ def _normalize(vectors: Any) -> np.ndarray:
 
 def _prune(now: float | None = None) -> None:
     current = now or time.time()
+    SESSION_ROOT.mkdir(parents=True, exist_ok=True)
     with _documents_lock:
         for key in [key for key, value in _documents.items() if current - value["last_accessed"] > DOCUMENT_TTL_SECONDS]:
             _documents.pop(key, None)
         while len(_documents) >= MAX_DOCUMENTS:
             _documents.popitem(last=False)
+    session_dirs = sorted((path for path in SESSION_ROOT.iterdir() if path.is_dir()), key=lambda path: path.stat().st_mtime)
+    for path in session_dirs:
+        if current - path.stat().st_mtime > DOCUMENT_TTL_SECONDS:
+            shutil.rmtree(path, ignore_errors=True)
+    for path in session_dirs[:-MAX_DOCUMENTS]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _session_dir(document_id: str) -> Path:
+    identifier = _clean(document_id)
+    if not re.fullmatch(r"[a-f0-9]{32}", identifier):
+        raise ValueError("Invalid temporary document ID.")
+    return SESSION_ROOT / identifier
+
+
+def _save_document(identifier: str, item: dict[str, Any]) -> None:
+    directory = _session_dir(identifier)
+    directory.mkdir(parents=True, exist_ok=True)
+    metadata = {key: value for key, value in item.items() if key != "index"}
+    (directory / "document.json").write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+    faiss.write_index(item["index"], str(directory / "index.faiss"))
+
+
+def _load_document(identifier: str) -> dict[str, Any] | None:
+    directory = _session_dir(identifier)
+    metadata_path, index_path = directory / "document.json", directory / "index.faiss"
+    if not metadata_path.is_file() or not index_path.is_file():
+        return None
+    item = json.loads(metadata_path.read_text(encoding="utf-8"))
+    item["index"] = faiss.read_index(str(index_path))
+    return item
 
 
 def _document(document_id: str) -> dict[str, Any]:
     identifier = _clean(document_id)
     _prune()
     with _documents_lock:
-        item = _documents.get(identifier)
+        item = _documents.get(identifier) or _load_document(identifier)
         if not item:
             raise ValueError("This temporary document session expired. Prepare the document again.")
         item["last_accessed"] = time.time()
+        _documents[identifier] = item
         _documents.move_to_end(identifier)
+        os.utime(_session_dir(identifier), None)
         return item
 
 
@@ -146,6 +182,7 @@ def prepare_document(file_path: str, original_filename: str = "") -> dict[str, A
         _prune(now)
         with _documents_lock:
             _documents[identifier] = record
+        _save_document(identifier, record)
         return {"ok": True, "document_id": identifier, "filename": record["filename"], "document_type": kind, "section_count": len(sections), "chunk_count": len(chunks), "expires_in_seconds": DOCUMENT_TTL_SECONDS}
     except Exception as exc:
         return _error(exc)
@@ -254,6 +291,7 @@ def generate_quiz(document_id: str, count: float = 5) -> dict[str, Any]:
         if not quiz:
             raise ValueError("No valid quiz questions were generated.")
         item["quiz"] = quiz
+        _save_document(_clean(document_id), item)
         return {"ok": True, "quiz": [{"id": i, "question": x["question"], "options": x["options"], "source": x["source"]} for i, x in enumerate(quiz)]}
     except Exception as exc:
         return _error(exc)
@@ -280,9 +318,13 @@ def grade_quiz(document_id: str, answers_json: str) -> dict[str, Any]:
 
 
 def delete_document(document_id: str) -> dict[str, Any]:
+    identifier = _clean(document_id)
     with _documents_lock:
-        removed = _documents.pop(_clean(document_id), None)
-    return {"ok": True, "deleted": bool(removed)}
+        removed = _documents.pop(identifier, None)
+    directory = _session_dir(identifier)
+    existed = directory.exists()
+    shutil.rmtree(directory, ignore_errors=True)
+    return {"ok": True, "deleted": bool(removed) or existed}
 
 
 with gr.Blocks(title="Smart Study Assistant") as demo:
