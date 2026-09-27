@@ -18,6 +18,7 @@ import gradio as gr
 import numpy as np
 import pdfplumber
 import spaces
+import torch
 from huggingface_hub import InferenceClient
 from pptx import Presentation
 from sentence_transformers import SentenceTransformer
@@ -98,7 +99,8 @@ def _model() -> SentenceTransformer:
     global _embedding_model
     with _embedding_lock:
         if _embedding_model is None:
-            _embedding_model = SentenceTransformer(EMBEDDING_MODEL, device="cuda")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _embedding_model = SentenceTransformer(EMBEDDING_MODEL, device=device)
     return _embedding_model
 
 
@@ -221,7 +223,6 @@ def _evidence(sources: list[dict[str, Any]]) -> str:
     return "\n\n".join(f"[Source {number}: {source['source_label']}]\n{source['excerpt']}" for number, source in enumerate(sources, 1))
 
 
-@spaces.GPU
 def ask_document(document_id: str, question: str) -> dict[str, Any]:
     try:
         _, sources = _retrieve(document_id, question)
